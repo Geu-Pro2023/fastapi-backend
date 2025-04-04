@@ -1,0 +1,25 @@
+# Core dependencies
+fastapi==0.109.1
+uvicorn==0.27.0
+python-multipart==0.0.6
+
+# AI/ML stack
+tensorflow==2.16.2
+numpy==1.26.3
+scikit-learn==1.4.0
+
+# Image processing
+opencv-python-headless==4.9.0.80  # Use headless for deployment
+
+# Visualization (needed for your plotting endpoints)
+matplotlib==3.8.2
+seaborn==0.13.1
+
+# Environment management
+python-dotenv==1.0.0
+
+# Monitoring (keep if you use Prometheus metrics)
+prometheus-client==0.20.0
+
+# Optional (remove if not used in production)
+# locust==2.20.1  # Load testing - keep only for development
