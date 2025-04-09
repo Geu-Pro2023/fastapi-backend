@@ -26,11 +26,10 @@ from pathlib import Path
 # ======================
 # CONFIGURATION
 # ======================
-# Improved production detection
-IS_PRODUCTION = os.getenv("RENDER", "").lower() == "true"
+IS_PRODUCTION = os.getenv("RENDER", "false").lower() == "true"
 
 # Path Configuration
-BASE_DIR = Path(__file__).parent.resolve()
+BASE_DIR = Path(__file__).parent
 MODEL_DIR = BASE_DIR / "models"
 LATEST_RESULTS_FILE = BASE_DIR / "latest_results.json"
 
@@ -38,40 +37,32 @@ LATEST_RESULTS_FILE = BASE_DIR / "latest_results.json"
 if IS_PRODUCTION:
     TEMP_DIR = Path("/tmp/wildguard_uploads")
     STATIC_DIR = Path("/opt/render/project/src/app/static")
-    # Ensure production directories exist
-    os.makedirs(TEMP_DIR, exist_ok=True)
-    os.makedirs(STATIC_DIR, exist_ok=True)
+    # Create directories if they don't exist
+    for dir_path in [TEMP_DIR, STATIC_DIR]:
+        dir_path.mkdir(parents=True, exist_ok=True)
 else:
     TEMP_DIR = BASE_DIR / "temp_uploads"
     STATIC_DIR = BASE_DIR / "static"
-    STATIC_DIR.mkdir(exist_ok=True, parents=True)
-    TEMP_DIR.mkdir(exist_ok=True, parents=True)
+
+# Ensure directories exist
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
 # Constants
 IMG_SIZE = (150, 150)
-MODEL_FILENAME = "retrained_model2_l2_adam.h5"
-
-# Try multiple possible model paths
-POSSIBLE_MODEL_PATHS = [
-    MODEL_DIR / MODEL_FILENAME,
-    BASE_DIR / "app" / "models" / MODEL_FILENAME,
-    Path("/opt/render/project/src/app/models") / MODEL_FILENAME
-]
+MODEL_PATH = MODEL_DIR / "retrained_model2_l2_adam.h5"
 
 # ======================
-# MODEL VERIFICATION
+# MODEL HANDLING
 # ======================
-def find_model_file():
-    """Find the model file in possible locations"""
-    for path in POSSIBLE_MODEL_PATHS:
-        if path.exists():
-            print(f"Found model at: {path}")
-            return path
-    raise FileNotFoundError(
-        f"Model not found in any of these locations: {POSSIBLE_MODEL_PATHS}\n"
-        f"Current working directory: {Path.cwd()}\n"
-        f"Directory contents: {list(Path.cwd().rglob('*'))}"
-    )
+def get_model_path():
+    """Get the correct model path for the current environment"""
+    if IS_PRODUCTION:
+        # Check both possible production paths
+        render_path = Path("/opt/render/project/src/app/models/retrained_model2_l2_adam.h5")
+        if render_path.exists():
+            return render_path
+    return MODEL_PATH
 
 # ======================
 # CLEANUP REGISTRATION
@@ -109,9 +100,12 @@ async def lifespan(app: FastAPI):
         tf.config.set_visible_devices([], 'GPU')
         print("Configured TensorFlow to use CPU only in production")
     
-    # Load model with validation
-    model_path = find_model_file()
+    # Get the correct model path
+    model_path = get_model_path()
     print(f"Loading model from: {model_path}")
+    
+    if not model_path.exists():
+        raise FileNotFoundError(f"Model file not found at {model_path}")
     
     try:
         app.state.model = load_model(model_path)
@@ -141,7 +135,7 @@ app = FastAPI(
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for now, tighten in production
+    allow_origins=["*"],  # Allow all origins for now
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -158,22 +152,15 @@ def save_plot_to_file(fig, filename_prefix):
     """Save matplotlib figure to static directory"""
     filename = f"{filename_prefix}_{uuid.uuid4().hex}.png"
     filepath = STATIC_DIR / filename
-    try:
-        fig.savefig(filepath, bbox_inches='tight', dpi=100)
-        plt.close(fig)
-        return filename
-    except Exception as e:
-        plt.close(fig)
-        raise HTTPException(status_code=500, detail=f"Failed to save plot: {str(e)}")
+    fig.savefig(filepath, bbox_inches='tight', dpi=100)
+    plt.close(fig)
+    return filename
 
 def preprocess_image(image):
     """Resize and normalize image for model prediction"""
-    try:
-        image = cv2.resize(image, IMG_SIZE)
-        image = image / 255.0
-        return np.expand_dims(image, axis=0)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Image processing failed: {str(e)}")
+    image = cv2.resize(image, IMG_SIZE)
+    image = image / 255.0
+    return np.expand_dims(image, axis=0)
 
 # ======================
 # API ENDPOINTS
@@ -184,32 +171,29 @@ async def root():
         "message": "WildGuard API is running",
         "docs": "/api-docs",
         "health_check": "/health",
-        "environment": "production" if IS_PRODUCTION else "development",
-        "model_loaded": hasattr(app.state, 'model')
+        "environment": "production" if IS_PRODUCTION else "development"
     }
 
 @app.get("/health")
 async def health_check():
     """Enhanced health check endpoint"""
-    model_loaded = hasattr(app.state, 'model')
+    model_path = get_model_path()
     return {
-        "status": "healthy" if model_loaded else "degraded",
-        "model_loaded": model_loaded,
-        "static_dir": str(STATIC_DIR),
-        "static_dir_exists": STATIC_DIR.exists(),
+        "status": "healthy",
+        "model_loaded": model_path.exists(),
+        "model_path": str(model_path),
+        "disk_space_gb": f"{shutil.disk_usage('/').free / (1024**3):.1f}",
+        "python_version": sys.version.split()[0],
         "temp_dir": str(TEMP_DIR),
-        "temp_dir_exists": TEMP_DIR.exists(),
+        "static_dir": str(STATIC_DIR),
         "is_production": IS_PRODUCTION
     }
 
 @app.post("/predict")
 async def predict(file: UploadFile = File(...)):
     """Endpoint for image predictions"""
-    if not hasattr(app.state, 'model'):
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
     temp_dir = TEMP_DIR / f"predict_{uuid.uuid4().hex}"
-    temp_dir.mkdir(exist_ok=True, parents=True)
+    temp_dir.mkdir(parents=True, exist_ok=True)
     
     try:
         # Save uploaded file
@@ -239,10 +223,11 @@ async def predict(file: UploadFile = File(...)):
                 "image_url": f"/api/static/{img_filename}"
             }
         }
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Prediction failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Prediction failed: {str(e)}"
+        )
     finally:
         shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -253,12 +238,9 @@ async def retrain(
     epochs: int = Form(10)
 ):
     """Endpoint for model retraining"""
-    if not hasattr(app.state, 'model'):
-        raise HTTPException(status_code=503, detail="Model not loaded")
-    
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     train_dir = TEMP_DIR / f"train_{timestamp}"
-    train_dir.mkdir(exist_ok=True, parents=True)
+    train_dir.mkdir(parents=True, exist_ok=True)
     
     try:
         # Save and extract dataset
@@ -273,11 +255,10 @@ async def retrain(
         def load_images(directory):
             images = []
             for img_path in directory.glob("*"):
-                if img_path.suffix.lower() in ['.jpg', '.jpeg', '.png']:
-                    img = cv2.imread(str(img_path))
-                    if img is not None:
-                        img = cv2.resize(img, IMG_SIZE)
-                        images.append(img / 255.0)
+                img = cv2.imread(str(img_path))
+                if img is not None:
+                    img = cv2.resize(img, IMG_SIZE)
+                    images.append(img / 255.0)
             return np.array(images)
         
         endangered_dir = train_dir / "dataset" / "Endangered"
@@ -337,7 +318,7 @@ async def retrain(
         fpr, tpr, _ = roc_curve(y_val, y_pred)
         roc_auc = auc(fpr, tpr)
         fig3 = plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, color='darkorange', label=f'ROC (AUC = {roc_auc:.2f})')
+        plt.plot(fpr, tpr, color='darkorange', label=f'ROC (AUC = {roc_auc:.2f}')
         plt.plot([0, 1], [0, 1], color='navy', linestyle='--')
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
@@ -375,11 +356,11 @@ async def retrain(
             json.dump(retrain_results, f)
 
         return retrain_results
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Training failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Training failed: {str(e)}"
+        )
     finally:
         plt.close('all')
         shutil.rmtree(train_dir, ignore_errors=True)
@@ -395,22 +376,6 @@ async def get_latest_results():
     
     with LATEST_RESULTS_FILE.open("r") as f:
         return json.load(f)
-
-@app.get("/debug/paths")
-async def debug_paths():
-    """Debug endpoint to verify file paths"""
-    return {
-        "is_production": IS_PRODUCTION,
-        "base_dir": str(BASE_DIR),
-        "model_paths": [str(p) for p in POSSIBLE_MODEL_PATHS],
-        "model_found": str(find_model_file()) if hasattr(app.state, 'model') else "Not found",
-        "static_dir": str(STATIC_DIR),
-        "static_dir_exists": STATIC_DIR.exists(),
-        "temp_dir": str(TEMP_DIR),
-        "temp_dir_exists": TEMP_DIR.exists(),
-        "current_working_dir": str(Path.cwd()),
-        "disk_usage": shutil.disk_usage("/")._asdict()
-    }
 
 if __name__ == "__main__":
     import uvicorn
