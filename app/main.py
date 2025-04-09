@@ -57,7 +57,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 IMG_SIZE = (150, 150)
 MODEL_PATH = MODEL_DIR / "retrained_model2_l2_adam.h5"
 VALID_IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
-MAX_FILE_SIZE_MB = 50  # Maximum allowed file size for uploads
+MAX_FILE_SIZE_MB = 500  # Maximum allowed file size for uploads
 
 # ======================
 # MODEL HANDLING
