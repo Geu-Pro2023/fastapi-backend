@@ -6,7 +6,7 @@ import json
 import sys
 import logging
 from datetime import datetime
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -23,6 +23,7 @@ import tensorflow as tf
 from contextlib import asynccontextmanager
 import atexit
 from pathlib import Path
+from typing import Optional
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -37,27 +38,28 @@ IS_PRODUCTION = os.getenv("RENDER", "false").lower() == "true"
 BASE_DIR = Path(__file__).parent
 MODEL_DIR = BASE_DIR / "models"
 LATEST_RESULTS_FILE = BASE_DIR / "latest_results.json"
+TRAINING_JOBS_DIR = BASE_DIR / "training_jobs"
 
 # Production vs Development paths
 if IS_PRODUCTION:
     TEMP_DIR = Path("/tmp/wildguard_uploads")
     STATIC_DIR = Path("/opt/render/project/src/app/static")
     # Create directories if they don't exist
-    for dir_path in [TEMP_DIR, STATIC_DIR]:
+    for dir_path in [TEMP_DIR, STATIC_DIR, TRAINING_JOBS_DIR]:
         dir_path.mkdir(parents=True, exist_ok=True)
 else:
     TEMP_DIR = BASE_DIR / "temp_uploads"
     STATIC_DIR = BASE_DIR / "static"
-
-# Ensure directories exist
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
-TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    TRAINING_JOBS_DIR.mkdir(parents=True, exist_ok=True)
 
 # Constants
 IMG_SIZE = (150, 150)
 MODEL_PATH = MODEL_DIR / "retrained_model2_l2_adam.h5"
 VALID_IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
 MAX_FILE_SIZE_MB = 500  # Maximum allowed file size for uploads
+PROD_MAX_FILE_SIZE_MB = 50  # Lower limit for production
+PROD_MAX_BATCH_SIZE = 8
+PROD_MAX_EPOCHS = 5
 
 # ======================
 # MODEL HANDLING
@@ -76,20 +78,23 @@ def get_model_path():
 # ======================
 def save_uploaded_file(upload_file: UploadFile, destination: Path):
     """Save uploaded file with size validation"""
-    # Check file size
+    max_size = (PROD_MAX_FILE_SIZE_MB if IS_PRODUCTION else MAX_FILE_SIZE_MB) * 1024 * 1024
     file_size = 0
-    max_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Convert MB to bytes
     
     with destination.open("wb") as buffer:
-        for chunk in upload_file.file:
+        while True:
+            chunk = await upload_file.read(8192)  # Read in chunks
+            if not chunk:
+                break
             file_size += len(chunk)
             if file_size > max_size:
                 raise HTTPException(
                     status_code=413,
-                    detail=f"File too large. Max size: {MAX_FILE_SIZE_MB}MB"
+                    detail=f"File too large. Max size: {max_size/1024/1024}MB"
                 )
             buffer.write(chunk)
     
+    await upload_file.seek(0)  # Rewind the file after reading
     logger.info(f"Saved file to {destination} (size: {file_size/1024/1024:.2f}MB)")
 
 # ======================
@@ -162,13 +167,14 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
     docs_url="/api-docs",
-    redoc_url=None
+    redoc_url=None,
+    timeout=600,  # 10 minutes timeout
 )
 
 # CORS Middleware
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allow all for testing, restrict in production
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -226,130 +232,19 @@ def validate_zip_file(zip_path: Path):
     except Exception as e:
         raise ValueError(f"ZIP validation error: {str(e)}")
 
-# ======================
-# API ENDPOINTS
-# ======================
-@app.get("/")
-async def root():
-    return {
-        "message": "WildGuard API is running",
-        "docs": "/api-docs",
-        "health_check": "/health",
-        "environment": "production" if IS_PRODUCTION else "development"
-    }
-
-@app.get("/health")
-async def health_check():
-    """Enhanced health check endpoint"""
-    model_path = get_model_path()
-    return {
-        "status": "healthy",
-        "model_loaded": model_path.exists(),
-        "model_path": str(model_path),
-        "disk_space_gb": f"{shutil.disk_usage('/').free / (1024**3):.1f}",
-        "python_version": sys.version.split()[0],
-        "temp_dir": str(TEMP_DIR),
-        "static_dir": str(STATIC_DIR),
-        "is_production": IS_PRODUCTION
-    }
-
-@app.post("/predict")
-async def predict(file: UploadFile = File(...)):
-    """Endpoint for image predictions"""
-    temp_dir = TEMP_DIR / f"predict_{uuid.uuid4().hex}"
-    temp_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Created temp directory for prediction: {temp_dir}")
+async def run_training_task(zip_path: Path, batch_size: int, epochs: int, job_id: str):
+    """Background task for model training"""
+    job_dir = TRAINING_JOBS_DIR / job_id
+    job_dir.mkdir()
+    results_file = job_dir / "results.json"
     
     try:
-        # Verify file is an image
-        if not any(file.filename.lower().endswith(ext) for ext in VALID_IMAGE_EXTENSIONS):
-            raise HTTPException(
-                status_code=400,
-                detail=f"Invalid file type. Supported formats: {', '.join(VALID_IMAGE_EXTENSIONS)}"
-            )
-
-        # Save uploaded file
-        file_path = temp_dir / file.filename
-        save_uploaded_file(file, file_path)
-        
-        # Process image
-        img = cv2.imread(str(file_path))
-        if img is None:
-            raise HTTPException(
-                status_code=400,
-                detail="Unable to read image file. Please check the file format."
-            )
-            
-        processed_img = preprocess_image(img)
-        confidence_score = app.state.model.predict(processed_img, verbose=0)[0][0]
-        confidence_percentage = round(confidence_score * 100, 2)
-        predicted_class = "Endangered" if confidence_score < 0.5 else "Non-Endangered"
-        
-        # Save result image
-        img_filename = f"prediction_{uuid.uuid4().hex}.png"
-        cv2.imwrite(str(STATIC_DIR / img_filename), img)
-        logger.info(f"Saved prediction result image: {img_filename}")
-        
-        return {
-            "status": "success",
-            "prediction": {
-                "class": predicted_class,
-                "confidence": confidence_percentage,
-                "image_url": f"/api/static/{img_filename}"
-            }
-        }
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Prediction failed: {str(e)}", exc_info=True)
-        raise HTTPException(
-            status_code=500,
-            detail=f"Prediction failed: {str(e)}"
-        )
-    finally:
-        try:
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            logger.info(f"Cleaned up temp directory: {temp_dir}")
-        except Exception as e:
-            logger.error(f"Failed to clean temp directory: {str(e)}")
-
-@app.post("/retrain")
-async def retrain(
-    file: UploadFile = File(...),
-    batch_size: int = Form(32),
-    epochs: int = Form(10)
-):
-    """Endpoint for model retraining"""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    train_dir = TEMP_DIR / f"train_{timestamp}"
-    train_dir.mkdir(parents=True, exist_ok=True)
-    logger.info(f"Created training directory: {train_dir}")
-    
-    try:
-        # Verify file is a ZIP file
-        if not file.filename.lower().endswith('.zip'):
-            raise HTTPException(
-                status_code=400,
-                detail="Uploaded file must be a .zip file"
-            )
-
-        # Save uploaded ZIP file
-        zip_path = train_dir / file.filename
-        save_uploaded_file(file, zip_path)
-        
         # Validate ZIP file structure
-        try:
-            validate_zip_file(zip_path)
-        except ValueError as e:
-            raise HTTPException(
-                status_code=400,
-                detail=str(e)
-            )
+        validate_zip_file(zip_path)
         
         # Extract the dataset
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-            zip_ref.extractall(train_dir / "dataset")
-        logger.info("Extracted training dataset")
+            zip_ref.extractall(job_dir / "dataset")
         
         # Load and preprocess images
         def load_images(directory):
@@ -360,30 +255,16 @@ async def retrain(
                     if img is not None:
                         img = cv2.resize(img, IMG_SIZE)
                         images.append(img / 255.0)
-                    else:
-                        logger.warning(f"Could not read image: {img_path}")
             return np.array(images)
         
-        endangered_dir = train_dir / "dataset" / "Endangered"
-        non_endangered_dir = train_dir / "dataset" / "Non-Endangered"
+        endangered_dir = job_dir / "dataset" / "Endangered"
+        non_endangered_dir = job_dir / "dataset" / "Non-Endangered"
         
-        # Verify extracted directories
-        if not endangered_dir.exists() or not non_endangered_dir.exists():
-            raise HTTPException(
-                status_code=400,
-                detail="Extracted folders must be named exactly 'Endangered' and 'Non-Endangered'"
-            )
-
         X_endangered = load_images(endangered_dir)
         X_non_endangered = load_images(non_endangered_dir)
         
         if len(X_endangered) == 0 or len(X_non_endangered) == 0:
-            raise HTTPException(
-                status_code=400,
-                detail="Dataset must contain valid images in both 'Endangered' and 'Non-Endangered' folders"
-            )
-        
-        logger.info(f"Loaded {len(X_endangered)} endangered and {len(X_non_endangered)} non-endangered images")
+            raise ValueError("Dataset must contain valid images in both folders")
 
         # Prepare data
         y_endangered = np.zeros(len(X_endangered))
@@ -395,7 +276,6 @@ async def retrain(
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
         
         # Train model
-        logger.info(f"Starting training with {epochs} epochs and batch size {batch_size}")
         history = app.state.model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
@@ -442,7 +322,7 @@ async def retrain(
         # Prepare results
         retrain_results = {
             "status": "success",
-            "timestamp": timestamp,
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "training_parameters": {
                 "batch_size": batch_size,
                 "epochs": epochs
@@ -466,28 +346,188 @@ async def retrain(
         }
 
         # Save results to file
+        with results_file.open("w") as f:
+            json.dump(retrain_results, f)
+        
+        # Also update latest results
         with LATEST_RESULTS_FILE.open("w") as f:
             json.dump(retrain_results, f)
-        logger.info("Training completed successfully")
-        
-        # Return the results directly
+            
         return retrain_results
         
+    except Exception as e:
+        logger.error(f"Training failed for job {job_id}: {str(e)}", exc_info=True)
+        error_result = {
+            "status": "error",
+            "job_id": job_id,
+            "error": str(e),
+            "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        }
+        with results_file.open("w") as f:
+            json.dump(error_result, f)
+        raise
+    finally:
+        plt.close('all')
+
+# ======================
+# API ENDPOINTS
+# ======================
+@app.get("/")
+async def root():
+    return {
+        "message": "WildGuard API is running",
+        "docs": "/api-docs",
+        "health_check": "/health",
+        "environment": "production" if IS_PRODUCTION else "development"
+    }
+
+@app.get("/health")
+async def health_check():
+    """Enhanced health check endpoint"""
+    model_path = get_model_path()
+    return {
+        "status": "healthy",
+        "model_loaded": model_path.exists(),
+        "model_path": str(model_path),
+        "disk_space_gb": f"{shutil.disk_usage('/').free / (1024**3):.1f}",
+        "python_version": sys.version.split()[0],
+        "temp_dir": str(TEMP_DIR),
+        "static_dir": str(STATIC_DIR),
+        "is_production": IS_PRODUCTION,
+        "training_jobs": len(list(TRAINING_JOBS_DIR.glob("*")))
+    }
+
+@app.post("/predict")
+async def predict(file: UploadFile = File(...)):
+    """Endpoint for image predictions"""
+    temp_dir = TEMP_DIR / f"predict_{uuid.uuid4().hex}"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    
+    try:
+        # Verify file is an image
+        if not any(file.filename.lower().endswith(ext) for ext in VALID_IMAGE_EXTENSIONS):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Supported formats: {', '.join(VALID_IMAGE_EXTENSIONS)}"
+            )
+
+        # Save uploaded file
+        file_path = temp_dir / file.filename
+        await save_uploaded_file(file, file_path)
+        
+        # Process image
+        img = cv2.imread(str(file_path))
+        if img is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Unable to read image file. Please check the file format."
+            )
+            
+        processed_img = preprocess_image(img)
+        confidence_score = app.state.model.predict(processed_img, verbose=0)[0][0]
+        confidence_percentage = round(confidence_score * 100, 2)
+        predicted_class = "Endangered" if confidence_score < 0.5 else "Non-Endangered"
+        
+        # Save result image
+        img_filename = f"prediction_{uuid.uuid4().hex}.png"
+        cv2.imwrite(str(STATIC_DIR / img_filename), img)
+        
+        return {
+            "status": "success",
+            "prediction": {
+                "class": predicted_class,
+                "confidence": confidence_percentage,
+                "image_url": f"/api/static/{img_filename}"
+            }
+        }
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"Training failed: {str(e)}", exc_info=True)
+        logger.error(f"Prediction failed: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
-            detail=f"Training failed: {str(e)}"
+            detail=f"Prediction failed: {str(e)}"
         )
     finally:
-        try:
-            plt.close('all')
-            shutil.rmtree(train_dir, ignore_errors=True)
-            logger.info(f"Cleaned up training directory: {train_dir}")
-        except Exception as e:
-            logger.error(f"Failed to clean training directory: {str(e)}")
+        shutil.rmtree(temp_dir, ignore_errors=True)
+
+@app.post("/retrain")
+async def retrain(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    batch_size: int = Form(8),
+    epochs: int = Form(5)
+):
+    """Endpoint for model retraining with background processing"""
+    if IS_PRODUCTION:
+        # Apply production limits
+        batch_size = min(batch_size, PROD_MAX_BATCH_SIZE)
+        epochs = min(epochs, PROD_MAX_EPOCHS)
+    
+    # Verify file is a ZIP file
+    if not file.filename.lower().endswith('.zip'):
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file must be a .zip file"
+        )
+    
+    # Create job directory
+    job_id = str(uuid.uuid4())
+    job_dir = TRAINING_JOBS_DIR / job_id
+    job_dir.mkdir()
+    
+    try:
+        # Save uploaded ZIP file
+        zip_path = job_dir / file.filename
+        await save_uploaded_file(file, zip_path)
+        
+        # Start background task
+        background_tasks.add_task(
+            run_training_task,
+            zip_path=zip_path,
+            batch_size=batch_size,
+            epochs=epochs,
+            job_id=job_id
+        )
+        
+        return {
+            "status": "started",
+            "job_id": job_id,
+            "message": "Training started in background. Check job status later.",
+            "parameters": {
+                "batch_size": batch_size,
+                "epochs": epochs
+            }
+        }
+    except Exception as e:
+        logger.error(f"Failed to start training job: {str(e)}", exc_info=True)
+        shutil.rmtree(job_dir, ignore_errors=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to start training: {str(e)}"
+        )
+
+@app.get("/training-status/{job_id}")
+async def get_training_status(job_id: str):
+    """Check status of a training job"""
+    job_dir = TRAINING_JOBS_DIR / job_id
+    results_file = job_dir / "results.json"
+    
+    if not job_dir.exists():
+        raise HTTPException(
+            status_code=404,
+            detail="Job ID not found"
+        )
+    
+    if results_file.exists():
+        with results_file.open("r") as f:
+            return json.load(f)
+    else:
+        return {
+            "status": "in_progress",
+            "job_id": job_id,
+            "message": "Training is still running"
+        }
 
 @app.get("/latest-results")
 async def get_latest_results():
