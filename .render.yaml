@@ -6,11 +6,11 @@ services:
       pip install --upgrade pip
       pip install -r requirements.txt
       mkdir -p /opt/render/project/src/app/static
+      mkdir -p /opt/render/project/src/app/temp_uploads
       mkdir -p /tmp/wildguard_uploads
-    startCommand: >
-      python -c "import tensorflow as tf; tf.config.set_visible_devices([], 'GPU'); print('GPU disabled for production')" &&
-      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 
-      --timeout-keep-alive 60 --log-level debug
+    startCommand: |
+      python -c "import tensorflow as tf; tf.config.set_visible_devices([], 'GPU'); print('GPU disabled for production')"
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --timeout-keep-alive 120
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.13
