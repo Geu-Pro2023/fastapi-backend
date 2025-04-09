@@ -4,6 +4,7 @@ import numpy as np
 import cv2
 import json
 import sys
+import logging
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -22,6 +23,10 @@ import tensorflow as tf
 from contextlib import asynccontextmanager
 import atexit
 from pathlib import Path
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # ======================
 # CONFIGURATION
@@ -51,6 +56,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 # Constants
 IMG_SIZE = (150, 150)
 MODEL_PATH = MODEL_DIR / "retrained_model2_l2_adam.h5"
+VALID_IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
 
 # ======================
 # MODEL HANDLING
@@ -75,8 +81,9 @@ def cleanup_temp_files():
                 shutil.rmtree(temp_file, ignore_errors=True)
             else:
                 temp_file.unlink(missing_ok=True)
+            logger.info(f"Cleaned up temporary file: {temp_file}")
         except Exception as e:
-            print(f"Failed to clean {temp_file}: {str(e)}")
+            logger.error(f"Failed to clean {temp_file}: {str(e)}")
 
 atexit.register(cleanup_temp_files)
 
@@ -86,11 +93,11 @@ atexit.register(cleanup_temp_files)
 class TerminalProgress(Callback):
     def on_epoch_end(self, epoch, logs=None):
         logs = logs or {}
-        print(f"Epoch {epoch + 1}/{self.params['epochs']} - "
-              f"loss: {logs.get('loss'):.4f} - "
-              f"accuracy: {logs.get('accuracy'):.4f} - "
-              f"val_loss: {logs.get('val_loss'):.4f} - "
-              f"val_accuracy: {logs.get('val_accuracy'):.4f}")
+        logger.info(f"Epoch {epoch + 1}/{self.params['epochs']} - "
+                   f"loss: {logs.get('loss'):.4f} - "
+                   f"accuracy: {logs.get('accuracy'):.4f} - "
+                   f"val_loss: {logs.get('val_loss'):.4f} - "
+                   f"val_accuracy: {logs.get('val_accuracy'):.4f}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -98,14 +105,16 @@ async def lifespan(app: FastAPI):
     tf.config.run_functions_eagerly(True)
     if IS_PRODUCTION:
         tf.config.set_visible_devices([], 'GPU')
-        print("Configured TensorFlow to use CPU only in production")
+        logger.info("Configured TensorFlow to use CPU only in production")
     
     # Get the correct model path
     model_path = get_model_path()
-    print(f"Loading model from: {model_path}")
+    logger.info(f"Loading model from: {model_path}")
     
     if not model_path.exists():
-        raise FileNotFoundError(f"Model file not found at {model_path}")
+        error_msg = f"Model file not found at {model_path}"
+        logger.error(error_msg)
+        raise FileNotFoundError(error_msg)
     
     try:
         app.state.model = load_model(model_path)
@@ -114,10 +123,12 @@ async def lifespan(app: FastAPI):
             loss='binary_crossentropy',
             metrics=['accuracy']
         )
-        print("Model loaded successfully")
+        logger.info("Model loaded successfully")
         yield
     except Exception as e:
-        raise RuntimeError(f"Model loading failed: {str(e)}")
+        error_msg = f"Model loading failed: {str(e)}"
+        logger.error(error_msg)
+        raise RuntimeError(error_msg)
     finally:
         if hasattr(app.state, 'model'):
             del app.state.model
@@ -154,13 +165,44 @@ def save_plot_to_file(fig, filename_prefix):
     filepath = STATIC_DIR / filename
     fig.savefig(filepath, bbox_inches='tight', dpi=100)
     plt.close(fig)
+    logger.info(f"Saved plot to: {filepath}")
     return filename
 
 def preprocess_image(image):
     """Resize and normalize image for model prediction"""
-    image = cv2.resize(image, IMG_SIZE)
-    image = image / 255.0
-    return np.expand_dims(image, axis=0)
+    try:
+        image = cv2.resize(image, IMG_SIZE)
+        image = image / 255.0
+        return np.expand_dims(image, axis=0)
+    except Exception as e:
+        logger.error(f"Image preprocessing failed: {str(e)}")
+        raise ValueError(f"Image processing error: {str(e)}")
+
+def validate_zip_file(zip_path: Path):
+    """Validate the structure and content of the training ZIP file"""
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            file_list = zip_ref.namelist()
+            
+            # Check for required directories
+            has_endangered = any('Endangered/' in f for f in file_list)
+            has_non_endangered = any('Non-Endangered/' in f for f in file_list)
+            
+            if not has_endangered or not has_non_endangered:
+                raise ValueError("ZIP must contain 'Endangered' and 'Non-Endangered' folders")
+                
+            # Check for at least one image in each directory
+            endangered_images = [f for f in file_list if 'Endangered/' in f and f.lower().endswith(VALID_IMAGE_EXTENSIONS)]
+            non_endangered_images = [f for f in file_list if 'Non-Endangered/' in f and f.lower().endswith(VALID_IMAGE_EXTENSIONS)]
+            
+            if not endangered_images or not non_endangered_images:
+                raise ValueError("Each folder must contain at least one valid image file")
+                
+            return True
+    except zipfile.BadZipFile:
+        raise ValueError("Invalid ZIP file format")
+    except Exception as e:
+        raise ValueError(f"ZIP validation error: {str(e)}")
 
 # ======================
 # API ENDPOINTS
@@ -194,17 +236,29 @@ async def predict(file: UploadFile = File(...)):
     """Endpoint for image predictions"""
     temp_dir = TEMP_DIR / f"predict_{uuid.uuid4().hex}"
     temp_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created temp directory for prediction: {temp_dir}")
     
     try:
+        # Verify file is an image
+        if not any(file.filename.lower().endswith(ext) for ext in VALID_IMAGE_EXTENSIONS):
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invalid file type. Supported formats: {', '.join(VALID_IMAGE_EXTENSIONS)}"
+            )
+
         # Save uploaded file
         file_path = temp_dir / file.filename
         with file_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        logger.info(f"Saved uploaded file to: {file_path}")
         
         # Process image
         img = cv2.imread(str(file_path))
         if img is None:
-            raise HTTPException(status_code=400, detail="Invalid image file")
+            raise HTTPException(
+                status_code=400,
+                detail="Unable to read image file. Please check the file format."
+            )
             
         processed_img = preprocess_image(img)
         confidence_score = app.state.model.predict(processed_img, verbose=0)[0][0]
@@ -214,6 +268,7 @@ async def predict(file: UploadFile = File(...)):
         # Save result image
         img_filename = f"prediction_{uuid.uuid4().hex}.png"
         cv2.imwrite(str(STATIC_DIR / img_filename), img)
+        logger.info(f"Saved prediction result image: {img_filename}")
         
         return {
             "status": "success",
@@ -223,13 +278,20 @@ async def predict(file: UploadFile = File(...)):
                 "image_url": f"/api/static/{img_filename}"
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Prediction failed: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Prediction failed: {str(e)}"
         )
     finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
+        try:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            logger.info(f"Cleaned up temp directory: {temp_dir}")
+        except Exception as e:
+            logger.error(f"Failed to clean temp directory: {str(e)}")
 
 @app.post("/retrain")
 async def retrain(
@@ -241,37 +303,69 @@ async def retrain(
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     train_dir = TEMP_DIR / f"train_{timestamp}"
     train_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(f"Created training directory: {train_dir}")
     
     try:
-        # Save and extract dataset
+        # Verify file is a ZIP file
+        if not file.filename.lower().endswith('.zip'):
+            raise HTTPException(
+                status_code=400,
+                detail="Uploaded file must be a .zip file"
+            )
+
+        # Save uploaded ZIP file
         zip_path = train_dir / file.filename
         with zip_path.open("wb") as buffer:
             shutil.copyfileobj(file.file, buffer)
+        logger.info(f"Saved training ZIP file to: {zip_path}")
         
+        # Validate ZIP file structure
+        try:
+            validate_zip_file(zip_path)
+        except ValueError as e:
+            raise HTTPException(
+                status_code=400,
+                detail=str(e)
+            )
+        
+        # Extract the dataset
         with zipfile.ZipFile(zip_path, 'r') as zip_ref:
             zip_ref.extractall(train_dir / "dataset")
+        logger.info("Extracted training dataset")
         
         # Load and preprocess images
         def load_images(directory):
             images = []
             for img_path in directory.glob("*"):
-                img = cv2.imread(str(img_path))
-                if img is not None:
-                    img = cv2.resize(img, IMG_SIZE)
-                    images.append(img / 255.0)
+                if img_path.suffix.lower() in VALID_IMAGE_EXTENSIONS:
+                    img = cv2.imread(str(img_path))
+                    if img is not None:
+                        img = cv2.resize(img, IMG_SIZE)
+                        images.append(img / 255.0)
+                    else:
+                        logger.warning(f"Could not read image: {img_path}")
             return np.array(images)
         
         endangered_dir = train_dir / "dataset" / "Endangered"
         non_endangered_dir = train_dir / "dataset" / "Non-Endangered"
         
+        # Verify extracted directories
+        if not endangered_dir.exists() or not non_endangered_dir.exists():
+            raise HTTPException(
+                status_code=400,
+                detail="Extracted folders must be named exactly 'Endangered' and 'Non-Endangered'"
+            )
+
         X_endangered = load_images(endangered_dir)
         X_non_endangered = load_images(non_endangered_dir)
         
         if len(X_endangered) == 0 or len(X_non_endangered) == 0:
             raise HTTPException(
                 status_code=400,
-                detail="Dataset must contain both 'Endangered' and 'Non-Endangered' folders with images"
+                detail="Dataset must contain valid images in both 'Endangered' and 'Non-Endangered' folders"
             )
+        
+        logger.info(f"Loaded {len(X_endangered)} endangered and {len(X_non_endangered)} non-endangered images")
 
         # Prepare data
         y_endangered = np.zeros(len(X_endangered))
@@ -283,6 +377,7 @@ async def retrain(
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=0.2, random_state=42)
         
         # Train model
+        logger.info(f"Starting training with {epochs} epochs and batch size {batch_size}")
         history = app.state.model.fit(
             X_train, y_train,
             validation_data=(X_val, y_val),
@@ -354,16 +449,25 @@ async def retrain(
 
         with LATEST_RESULTS_FILE.open("w") as f:
             json.dump(retrain_results, f)
-
+        logger.info("Training completed successfully")
+        
         return retrain_results
+        
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Training failed: {str(e)}", exc_info=True)
         raise HTTPException(
             status_code=500,
             detail=f"Training failed: {str(e)}"
         )
     finally:
-        plt.close('all')
-        shutil.rmtree(train_dir, ignore_errors=True)
+        try:
+            plt.close('all')
+            shutil.rmtree(train_dir, ignore_errors=True)
+            logger.info(f"Cleaned up training directory: {train_dir}")
+        except Exception as e:
+            logger.error(f"Failed to clean training directory: {str(e)}")
 
 @app.get("/latest-results")
 async def get_latest_results():
@@ -374,8 +478,15 @@ async def get_latest_results():
             detail="No training results available. Please run /retrain first."
         )
     
-    with LATEST_RESULTS_FILE.open("r") as f:
-        return json.load(f)
+    try:
+        with LATEST_RESULTS_FILE.open("r") as f:
+            return json.load(f)
+    except Exception as e:
+        logger.error(f"Failed to read latest results: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to load training results"
+        )
 
 if __name__ == "__main__":
     import uvicorn
