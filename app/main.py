@@ -8,7 +8,7 @@ import logging
 from datetime import datetime
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
 from tensorflow.keras.models import load_model
 from tensorflow.keras.callbacks import Callback
@@ -57,6 +57,7 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 IMG_SIZE = (150, 150)
 MODEL_PATH = MODEL_DIR / "retrained_model2_l2_adam.h5"
 VALID_IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png')
+MAX_FILE_SIZE_MB = 50  # Maximum allowed file size for uploads
 
 # ======================
 # MODEL HANDLING
@@ -69,6 +70,27 @@ def get_model_path():
         if render_path.exists():
             return render_path
     return MODEL_PATH
+
+# ======================
+# FILE HANDLING
+# ======================
+def save_uploaded_file(upload_file: UploadFile, destination: Path):
+    """Save uploaded file with size validation"""
+    # Check file size
+    file_size = 0
+    max_size = MAX_FILE_SIZE_MB * 1024 * 1024  # Convert MB to bytes
+    
+    with destination.open("wb") as buffer:
+        for chunk in upload_file.file:
+            file_size += len(chunk)
+            if file_size > max_size:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"File too large. Max size: {MAX_FILE_SIZE_MB}MB"
+                )
+            buffer.write(chunk)
+    
+    logger.info(f"Saved file to {destination} (size: {file_size/1024/1024:.2f}MB)")
 
 # ======================
 # CLEANUP REGISTRATION
@@ -248,9 +270,7 @@ async def predict(file: UploadFile = File(...)):
 
         # Save uploaded file
         file_path = temp_dir / file.filename
-        with file_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        logger.info(f"Saved uploaded file to: {file_path}")
+        save_uploaded_file(file, file_path)
         
         # Process image
         img = cv2.imread(str(file_path))
@@ -315,9 +335,7 @@ async def retrain(
 
         # Save uploaded ZIP file
         zip_path = train_dir / file.filename
-        with zip_path.open("wb") as buffer:
-            shutil.copyfileobj(file.file, buffer)
-        logger.info(f"Saved training ZIP file to: {zip_path}")
+        save_uploaded_file(file, zip_path)
         
         # Validate ZIP file structure
         try:
@@ -413,7 +431,7 @@ async def retrain(
         fpr, tpr, _ = roc_curve(y_val, y_pred)
         roc_auc = auc(fpr, tpr)
         fig3 = plt.figure(figsize=(8, 6))
-        plt.plot(fpr, tpr, color='darkorange', label=f'ROC (AUC = {roc_auc:.2f}')
+        plt.plot(fpr, tpr, color='darkorange', label=f'ROC (AUC = {roc_auc:.2f})')
         plt.plot([0, 1], [0, 1], color='navy', linestyle='--')
         plt.xlabel('False Positive Rate')
         plt.ylabel('True Positive Rate')
@@ -421,7 +439,7 @@ async def retrain(
         plt.legend()
         roc_filename = save_plot_to_file(fig3, "roc_curve")
         
-        # Save results
+        # Prepare results
         retrain_results = {
             "status": "success",
             "timestamp": timestamp,
@@ -447,10 +465,12 @@ async def retrain(
             }
         }
 
+        # Save results to file
         with LATEST_RESULTS_FILE.open("w") as f:
             json.dump(retrain_results, f)
         logger.info("Training completed successfully")
         
+        # Return the results directly
         return retrain_results
         
     except HTTPException:
@@ -487,6 +507,14 @@ async def get_latest_results():
             status_code=500,
             detail="Failed to load training results"
         )
+
+@app.get("/api/static/{filename}")
+async def serve_static(filename: str):
+    """Serve static files directly"""
+    file_path = STATIC_DIR / filename
+    if not file_path.exists():
+        raise HTTPException(status_code=404, detail="File not found")
+    return FileResponse(file_path)
 
 if __name__ == "__main__":
     import uvicorn
