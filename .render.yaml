@@ -2,8 +2,22 @@ services:
   - name: wildguard-api
     type: web
     runtime: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: uvicorn app.main:app --host 0.0.0.0 --port 8000
+    buildCommand: |
+      pip install --upgrade pip
+      pip install -r requirements.txt
+      # Create production directories
+      mkdir -p /opt/render/project/src/app/static
+      mkdir -p /tmp/wildguard_uploads
+    startCommand: |
+      python -c "import tensorflow as tf; tf.config.set_visible_devices([], 'GPU')" &&
+      uvicorn app.main:app --host 0.0.0.0 --port 8000 --workers 1 --timeout-keep-alive 60
     envVars:
       - key: PYTHON_VERSION
         value: 3.9.13
+      - key: RENDER
+        value: "true"
+    plan: standard
+    disk:
+      name: wildguard-storage
+      mountPath: /opt/render/project/src/app/static
+      sizeGB: 5
